@@ -53,7 +53,18 @@ class PegasusApp:
         self.world = self.pg.world
 
         # Launch one of the worlds provided by NVIDIA
-        self.pg.load_environment(SIMULATION_ENVIRONMENTS["Box Room"])
+        self.pg.load_environment(SIMULATION_ENVIRONMENTS["Rusko Summer"])
+
+        # load_environment() is ASYNCHRONOUS: the USD is referenced over the next few
+        # frames. For a large terrain we must wait until it is actually present before
+        # spawning the vehicle and resetting physics, otherwise the drone is created and
+        # physics is initialized before the terrain collider exists and it free-falls
+        # straight through the not-yet-loaded ground.
+        for _ in range(2000):
+            simulation_app.update()
+            layout = self.world.stage.GetPrimAtPath("/World/layout")
+            if layout.IsValid() and layout.GetChildren():
+                break
 
         # Create the vehicle
         # Try to spawn the selected robot in the world to the specified namespace
