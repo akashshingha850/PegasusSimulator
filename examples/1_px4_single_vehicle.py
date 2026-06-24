@@ -31,7 +31,24 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 import os.path
 import numpy as np
 from scipy.spatial.transform import Rotation
-from pxr import UsdGeom, Gf
+from pxr import UsdGeom, Gf, UsdPhysics
+
+# --- Rusko Summer (3dgrut Gaussian-splat export) spawn geometry --------------
+# The world is a 3D Gaussian splat (rendered, no collision) bundled with a
+# triangle mesh used purely for physics. The mesh is referenced under
+# /World/layout/mesh and the splat under /World/layout/gaussians.
+#
+# The terrain is small (~9 x 15 x 11 units, Z-up, metersPerUnit=1) and bumpy
+# everywhere, so resting the drone directly on it tilts it and trips PX4's
+# "Preflight Fail: Attitude failure (roll)" check. We instead drop a small,
+# invisible, level collision pad just above the surface near the scene centre
+# and spawn the drone on that. Tune these if you want a different launch spot.
+RUSKO_MESH_PATH = "/World/layout/mesh"      # collider geometry
+RUSKO_SPLAT_PATH = "/World/layout/gaussians"  # rendered splat
+RUSKO_SPAWN_XY = (0.18, 1.31)               # scene centre (mesh bbox centre)
+RUSKO_PAD_TOP_Z = 1.65                      # just above local surface top (~1.55)
+RUSKO_PAD_HALF = 1.0                        # pad half-extent in X/Y
+
 
 class PegasusApp:
     """
@@ -62,11 +79,16 @@ class PegasusApp:
         # spawning the vehicle and resetting physics, otherwise the drone is created and
         # physics is initialized before the terrain collider exists and it free-falls
         # straight through the not-yet-loaded ground.
-        for _ in range(2000):
+        # Wait until the collision mesh itself is composed in (not just /World/layout).
+        for _ in range(4000):
             simulation_app.update()
-            layout = self.world.stage.GetPrimAtPath("/World/layout")
-            if layout.IsValid() and layout.GetChildren():
+            mesh = self.world.stage.GetPrimAtPath(RUSKO_MESH_PATH)
+            if mesh.IsValid() and UsdGeom.Mesh(mesh).GetPointsAttr().HasValue():
                 break
+
+        # Turn the bundled mesh into a static collider for the splat scene and add
+        # the level spawn pad the drone takes off from.
+        self._setup_rusko_collision()
 
         # Create the vehicle
         # Try to spawn the selected robot in the world to the specified namespace
@@ -80,11 +102,12 @@ class PegasusApp:
         })
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
+        spawn_z = RUSKO_PAD_TOP_Z + 0.08  # rest the drone just above the pad surface
         self.vehicle = Multirotor(
             "/World/quadrotor",
             ROBOTS['Pegasus'],
             0,
-            [0.0, 0.0, 0.07],
+            [RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1], spawn_z],
             Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
             config=config_multirotor,
         )
@@ -99,13 +122,49 @@ class PegasusApp:
         # Chase-camera offset from the drone, in the drone's BODY (FLU) frame (meters):
         # behind (-X = aft), and above (+Z). This offset is rotated by the drone's yaw
         # each frame so the camera always sits behind the drone as it turns. Tune to taste.
-        self.camera_offset = np.array([-20.0, 0.0, 5.0])
+        self.camera_offset = np.array([-4.0, 0.0, 1.5])
+
+        # Point the viewport at the (small) splat scene so it's framed on startup.
+        self.pg.set_viewport_camera(
+            [RUSKO_SPAWN_XY[0] + 6.0, RUSKO_SPAWN_XY[1] - 6.0, RUSKO_PAD_TOP_Z + 4.0],
+            [RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1], RUSKO_PAD_TOP_Z],
+        )
 
         # Reset the simulation environment so that all articulations (aka robots) are initialized
         self.world.reset()
 
         # Auxiliar variable for the timeline callback example
         self.stop_sim = False
+
+    def _setup_rusko_collision(self):
+        """Make the bundled terrain mesh a static collider (hidden, so only the
+        Gaussian splat shows) and add an invisible level pad for the drone to
+        take off from."""
+        stage = self.world.stage
+
+        mesh = stage.GetPrimAtPath(RUSKO_MESH_PATH)
+        if mesh.IsValid():
+            UsdPhysics.CollisionAPI.Apply(mesh)
+            mca = UsdPhysics.MeshCollisionAPI.Apply(mesh)
+            # "none" = exact triangle-mesh collider (valid for static geometry).
+            mca.CreateApproximationAttr().Set("none")
+            UsdGeom.Imageable(mesh).MakeInvisible()
+        else:
+            carb.log_warn(f"Rusko collider mesh not found at {RUSKO_MESH_PATH}")
+
+        # Invisible, level static collision pad placed just above the local
+        # surface at the spawn point (the splat terrain itself is too bumpy for a
+        # clean level takeoff). Cube spans [-1,1]; scale to a thin slab.
+        pad = UsdGeom.Cube.Define(stage, "/World/spawn_pad")
+        pad.GetSizeAttr().Set(2.0)
+        half_thickness = 0.1
+        xf = UsdGeom.Xformable(pad.GetPrim())
+        xf.ClearXformOpOrder()
+        xf.AddTranslateOp().Set(Gf.Vec3d(RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1],
+                                         RUSKO_PAD_TOP_Z - half_thickness))
+        xf.AddScaleOp().Set(Gf.Vec3f(RUSKO_PAD_HALF, RUSKO_PAD_HALF, half_thickness))
+        UsdPhysics.CollisionAPI.Apply(pad.GetPrim())
+        UsdGeom.Imageable(pad.GetPrim()).MakeInvisible()
 
     def _aim_chase_camera(self, eye, target):
         """Place the chase-camera prim at `eye` looking at `target` (world frame, +Z up)."""
