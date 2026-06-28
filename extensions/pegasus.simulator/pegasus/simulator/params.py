@@ -61,7 +61,8 @@ PEGASUS_ENVIRONMENTS = {
     "Box Room": ASSET_PATH + "/Worlds/Box/Box.usd",
     "Box with Cylinders": ASSET_PATH + "/Worlds/BoxWithCylinders/BoxWithCylinders.usd",
     "My World": "/home/ubuntu/isaacsim/my_worlds/sample_world.usda",
-    "Rusko Summer": "/home/ubuntu/isaacsim/my_worlds/rusko_summer/rusko_summer.usdz",
+    "Rusko Summer": "/home/ubuntu/isaacsim/my_worlds/rusko_summer/rusko_summer_nurec.usdz",
+    "Rusko Winter": "/home/ubuntu/isaacsim/my_worlds/rusko_winter/rusko_winter.usdz",
 }
 
 SIMULATION_ENVIRONMENTS = {}

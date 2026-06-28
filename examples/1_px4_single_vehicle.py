@@ -15,6 +15,16 @@ from isaacsim import SimulationApp
 # as this is the object that will load all the extensions and load the actual simulator.
 simulation_app = SimulationApp({"headless": False})
 
+# The Rusko Summer world is an Omniverse NuRec (neural-reconstruction) volume. Its
+# prims use the OmniNuRecFieldAsset schema, which is NOT in the default experience;
+# without it the RTX renderer can't recognise the volume and the photoreal terrain
+# never draws. Enable the schema BEFORE the world USD is composed (pulled from the
+# NVIDIA registry on first run, then cached locally).
+from isaacsim.core.utils.extensions import enable_extension
+if not enable_extension("omni.usd.schema.omni_nurec_types"):
+    carb.log_warn("Could not enable omni.usd.schema.omni_nurec_types; "
+                  "the NuRec terrain may not render.")
+
 # -----------------------------------
 # The actual script should start here
 # -----------------------------------
@@ -31,23 +41,28 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 import os.path
 import numpy as np
 from scipy.spatial.transform import Rotation
-from pxr import UsdGeom, Gf, UsdPhysics
+from pxr import UsdGeom, UsdLux, Gf, UsdPhysics
 
-# --- Rusko Summer (3dgrut Gaussian-splat export) spawn geometry --------------
-# The world is a 3D Gaussian splat (rendered, no collision) bundled with a
-# triangle mesh used purely for physics. The mesh is referenced under
-# /World/layout/mesh and the splat under /World/layout/gaussians.
-#
-# The terrain is small (~9 x 15 x 11 units, Z-up, metersPerUnit=1) and bumpy
-# everywhere, so resting the drone directly on it tilts it and trips PX4's
-# "Preflight Fail: Attitude failure (roll)" check. We instead drop a small,
-# invisible, level collision pad just above the surface near the scene centre
-# and spawn the drone on that. Tune these if you want a different launch spot.
-RUSKO_MESH_PATH = "/World/layout/mesh"      # collider geometry
-RUSKO_SPLAT_PATH = "/World/layout/gaussians"  # rendered splat
-RUSKO_SPAWN_XY = (0.18, 1.31)               # scene centre (mesh bbox centre)
-RUSKO_PAD_TOP_Z = 1.65                      # just above local surface top (~1.55)
-RUSKO_PAD_HALF = 1.0                        # pad half-extent in X/Y
+# --- Rusko Summer (NuRec neural-reconstruction export) world setup -----------
+# Unlike the winter export, the summer NuRec ships ONLY the photoreal volume (no
+# collision proxy mesh). It is therefore purely visual; the drone takes off from a
+# flat, invisible ground collider we add ourselves. Pegasus references the world
+# under /World/layout, so in-sim the NuRec volume prim is:
+RUSKO_VOLUME_PATH = "/World/layout/gauss"   # the OmniNuRec Volume prim (carries xform + extent)
+RUSKO_SPAWN_XY = (0.0, 0.0)                 # where the drone spawns (world XY)
+RUSKO_GROUND_Z = 0.0                        # top of the flat ground collider / takeoff surface
+# The reconstruction has NO real-world scale and its native extent is ~660k units
+# across. Auto-fit: scale the volume uniformly (about its extent centre) so its widest
+# horizontal extent maps to this many metres next to the (metric) drone.
+RUSKO_TARGET_SPAN_M = 170.0
+# Where the scaled volume's extent centre is placed in world. Tune Z to slide the
+# terrain up/down until its ground meets RUSKO_GROUND_Z — we can't know the ground's
+# height inside the volume without rendering it.
+RUSKO_TERRAIN_CENTER = (0.0, 0.0, 0.0)
+# Extra rotation (degrees, applied XYZ about the terrain centre) in case the capture's
+# "up" isn't world +Z and the terrain looks tilted / upside-down. (0,0,0) = as-shipped.
+RUSKO_EXTRA_EULER = (0.0, 0.0, 0.0)
+RUSKO_ENV_NAME = "Rusko Summer"
 
 
 class PegasusApp:
@@ -71,24 +86,22 @@ class PegasusApp:
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
 
-        # Launch one of the worlds provided by NVIDIA
-        self.pg.load_environment(SIMULATION_ENVIRONMENTS["Rusko Summer"])
+        # Load the photoreal Rusko Summer NuRec world.
+        self.pg.load_environment(SIMULATION_ENVIRONMENTS[RUSKO_ENV_NAME])
 
         # load_environment() is ASYNCHRONOUS: the USD is referenced over the next few
-        # frames. For a large terrain we must wait until it is actually present before
-        # spawning the vehicle and resetting physics, otherwise the drone is created and
-        # physics is initialized before the terrain collider exists and it free-falls
-        # straight through the not-yet-loaded ground.
-        # Wait until the collision mesh itself is composed in (not just /World/layout).
+        # frames. Wait until the NuRec volume (and its extent) is actually composed in
+        # before we scale it and add the ground, so the auto-fit has real bounds to work
+        # with and physics doesn't initialize against a not-yet-loaded world.
         for _ in range(4000):
             simulation_app.update()
-            mesh = self.world.stage.GetPrimAtPath(RUSKO_MESH_PATH)
-            if mesh.IsValid() and UsdGeom.Mesh(mesh).GetPointsAttr().HasValue():
+            vol = self.world.stage.GetPrimAtPath(RUSKO_VOLUME_PATH)
+            if vol.IsValid() and vol.GetAttribute("extent").HasValue():
                 break
 
-        # Turn the bundled mesh into a static collider for the splat scene and add
-        # the level spawn pad the drone takes off from.
-        self._setup_rusko_collision()
+        # Scale/orient the photoreal volume and add the flat ground + spawn surface
+        # the drone takes off from (the summer NuRec ships no collider of its own).
+        self._setup_rusko_summer()
 
         # Create the vehicle
         # Try to spawn the selected robot in the world to the specified namespace
@@ -102,7 +115,7 @@ class PegasusApp:
         })
         config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
-        spawn_z = RUSKO_PAD_TOP_Z + 0.08  # rest the drone just above the pad surface
+        spawn_z = self._ground_top_z + 0.08  # rest the drone just above the ground surface
         self.vehicle = Multirotor(
             "/World/quadrotor",
             ROBOTS['Pegasus'],
@@ -124,10 +137,12 @@ class PegasusApp:
         # each frame so the camera always sits behind the drone as it turns. Tune to taste.
         self.camera_offset = np.array([-4.0, 0.0, 1.5])
 
-        # Point the viewport at the (small) splat scene so it's framed on startup.
+        # Frame the viewport on the scene at startup; the offset tracks the world span
+        # so the whole terrain stays in view.
+        fr = 0.6 * RUSKO_TARGET_SPAN_M
         self.pg.set_viewport_camera(
-            [RUSKO_SPAWN_XY[0] + 6.0, RUSKO_SPAWN_XY[1] - 6.0, RUSKO_PAD_TOP_Z + 4.0],
-            [RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1], RUSKO_PAD_TOP_Z],
+            [RUSKO_SPAWN_XY[0] + fr, RUSKO_SPAWN_XY[1] - fr, self._ground_top_z + 0.7 * fr],
+            [RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1], self._ground_top_z],
         )
 
         # Reset the simulation environment so that all articulations (aka robots) are initialized
@@ -136,35 +151,63 @@ class PegasusApp:
         # Auxiliar variable for the timeline callback example
         self.stop_sim = False
 
-    def _setup_rusko_collision(self):
-        """Make the bundled terrain mesh a static collider (hidden, so only the
-        Gaussian splat shows) and add an invisible level pad for the drone to
-        take off from."""
+    def _setup_rusko_summer(self):
+        """Scale/orient the photoreal NuRec volume to a sane metric size and add the
+        flat, invisible ground collider the drone takes off from. The summer NuRec is
+        render-only (no collision proxy mesh), so the ground is ours, not the terrain's."""
         stage = self.world.stage
+        self._ground_top_z = RUSKO_GROUND_Z
 
-        mesh = stage.GetPrimAtPath(RUSKO_MESH_PATH)
-        if mesh.IsValid():
-            UsdPhysics.CollisionAPI.Apply(mesh)
-            mca = UsdPhysics.MeshCollisionAPI.Apply(mesh)
-            # "none" = exact triangle-mesh collider (valid for static geometry).
-            mca.CreateApproximationAttr().Set("none")
-            UsdGeom.Imageable(mesh).MakeInvisible()
+        # --- Auto-fit + place the photoreal NuRec volume ---
+        vol = stage.GetPrimAtPath(RUSKO_VOLUME_PATH)
+        if vol.IsValid():
+            ext = vol.GetAttribute("extent").Get()
+            if ext:
+                mn = np.array(ext[0], dtype=float)
+                mx = np.array(ext[1], dtype=float)
+                c = (mn + mx) / 2.0
+                span = float(max(mx[0] - mn[0], mx[1] - mn[1]))
+                s = RUSKO_TARGET_SPAN_M / span if span > 1e-6 else 1.0
+            else:
+                carb.log_warn("Rusko: NuRec volume has no extent; loading unscaled.")
+                c = np.zeros(3)
+                s = 1.0
+            cv = Gf.Vec3d(float(c[0]), float(c[1]), float(c[2]))
+            tgt = Gf.Vec3d(float(RUSKO_TERRAIN_CENTER[0]),
+                           float(RUSKO_TERRAIN_CENTER[1]),
+                           float(RUSKO_TERRAIN_CENTER[2]))
+            R = Gf.Matrix4d(1.0).SetRotate(
+                Gf.Rotation(Gf.Vec3d(1, 0, 0), RUSKO_EXTRA_EULER[0])
+                * Gf.Rotation(Gf.Vec3d(0, 1, 0), RUSKO_EXTRA_EULER[1])
+                * Gf.Rotation(Gf.Vec3d(0, 0, 1), RUSKO_EXTRA_EULER[2]))
+            S = Gf.Matrix4d(1.0).SetScale(Gf.Vec3d(s, s, s))
+            # row-vector order: move extent centre to origin, rotate, scale, move to target
+            M = (Gf.Matrix4d(1.0).SetTranslate(-cv) * R * S
+                 * Gf.Matrix4d(1.0).SetTranslate(tgt))
+            x = UsdGeom.Xformable(vol)
+            x.ClearXformOpOrder()
+            x.AddTransformOp().Set(M)
         else:
-            carb.log_warn(f"Rusko collider mesh not found at {RUSKO_MESH_PATH}")
+            carb.log_warn(f"Rusko NuRec volume not found at {RUSKO_VOLUME_PATH}")
 
-        # Invisible, level static collision pad placed just above the local
-        # surface at the spawn point (the splat terrain itself is too bumpy for a
-        # clean level takeoff). Cube spans [-1,1]; scale to a thin slab.
-        pad = UsdGeom.Cube.Define(stage, "/World/spawn_pad")
-        pad.GetSizeAttr().Set(2.0)
-        half_thickness = 0.1
-        xf = UsdGeom.Xformable(pad.GetPrim())
-        xf.ClearXformOpOrder()
-        xf.AddTranslateOp().Set(Gf.Vec3d(RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1],
-                                         RUSKO_PAD_TOP_Z - half_thickness))
-        xf.AddScaleOp().Set(Gf.Vec3f(RUSKO_PAD_HALF, RUSKO_PAD_HALF, half_thickness))
-        UsdPhysics.CollisionAPI.Apply(pad.GetPrim())
-        UsdGeom.Imageable(pad.GetPrim()).MakeInvisible()
+        # --- Flat, invisible ground collider + takeoff surface ---
+        # Cube spans [-1,1]; scale to a wide, thin slab whose TOP sits at RUSKO_GROUND_Z.
+        ground = UsdGeom.Cube.Define(stage, "/World/rusko_ground")
+        ground.GetSizeAttr().Set(2.0)
+        half_thickness = 0.5
+        half_extent = max(RUSKO_TARGET_SPAN_M, 100.0)
+        gx = UsdGeom.Xformable(ground.GetPrim())
+        gx.ClearXformOpOrder()
+        gx.AddTranslateOp().Set(Gf.Vec3d(RUSKO_SPAWN_XY[0], RUSKO_SPAWN_XY[1],
+                                         RUSKO_GROUND_Z - half_thickness))
+        gx.AddScaleOp().Set(Gf.Vec3f(half_extent, half_extent, half_thickness))
+        UsdPhysics.CollisionAPI.Apply(ground.GetPrim())
+        UsdGeom.Imageable(ground.GetPrim()).MakeInvisible()
+
+        # The NuRec volume is self-emissive, but add a dome light so the (unlit) ground
+        # and any composited synthetic assets are visible too.
+        dome = UsdLux.DomeLight.Define(stage, "/World/rusko_dome_light")
+        dome.CreateIntensityAttr(1000.0)
 
     def _aim_chase_camera(self, eye, target):
         """Place the chase-camera prim at `eye` looking at `target` (world frame, +Z up)."""
