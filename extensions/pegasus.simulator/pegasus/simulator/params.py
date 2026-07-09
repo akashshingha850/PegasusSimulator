@@ -47,6 +47,7 @@ NVIDIA_SIMULATION_ENVIRONMENTS = {
     "Warehouse with Forklifts": "Simple_Warehouse/warehouse_with_forklifts.usd",
     "Warehouse with Shelves": "Simple_Warehouse/warehouse_multiple_shelves.usd",
     "Full Warehouse": "Simple_Warehouse/full_warehouse.usd",
+    "Small Warehouse": "Digital_Twin_Warehouse/small_warehouse_digital_twin.usd",
     "Flat Plane": "Terrains/flat_plane.usd",
     "Rough Plane": "Terrains/rough_plane.usd",
     "Slope Plane": "Terrains/slope.usd",
